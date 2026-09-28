@@ -69,6 +69,7 @@ prepare_polls <- function(
     ) |>
     arrange(Midate) |>
     mutate(
+      `Polling organisation` = trimws(`Polling organisation`),
       days = as.numeric(
         Midate - min(Midate)
       )
@@ -141,26 +142,23 @@ fit_poll_trends <- function(
 }
 
 ###############################################################################
-# POLL RESIDUALS
+# RAW POLL RESIDUALS
 #
 # Purpose:
-#   Quantify historical polling error relative to each party's estimated trend.
+# Measure deviation from the LOESS trend before adjusting for pollster bias.
 #
 # Definition:
-#   Residual = Observed Poll Result - LOESS Trend Estimate
 #
-# Why residuals are important:
-#   The simulation model assumes future polling uncertainty resembles
-#   historical polling uncertainty.
+# Raw Residual =
+# Observed Poll
+# - LOESS Trend
 #
-# These residuals provide:
-#   - Typical polling volatility.
-#   - The basis for estimating covariance between parties.
-#   - Information about whether parties tend to move together or in opposite
-#     directions.
+# Components contained within residuals:
 #
-# Output:
-#   Additional nameOfParty_resid columns for every party.
+# - Sampling error
+# - Campaign noise
+# - Pollster house effects
+# - Unexplained variation
 ###############################################################################
 
 add_poll_residuals <- function(
@@ -178,6 +176,114 @@ add_poll_residuals <- function(
   polls
   
 }
+
+###############################################################################
+# HOUSE EFFECT ESTIMATION
+#
+# Purpose:
+#   Estimate systematic pollster-specific bias relative to trend.
+#
+# Method:
+#   - Calculate average residual for each polling organisation.
+#   - Apply empirical-Bayes style shrinkage toward zero.
+#   - Larger poll histories receive less shrinkage.
+#
+# Shrinkage:
+#
+#   adjusted =
+#       raw_effect *
+#       n / (n + shrinkage_k)
+#
+# Output:
+#   Party-specific house effect columns.
+###############################################################################
+
+estimate_house_effects <- function(
+    polls,
+    parties,
+    organisation_col = "Polling organisation",
+    weight_col = "Sample size",
+    shrinkage_k = 10
+) {
+  
+  house_effect_tables <- list()
+  
+  for (p in parties) {
+    
+    resid_col <- paste0(p, "_resid")
+    
+    house_table <-
+      polls |>
+      group_by(.data[[organisation_col]]) |>
+      summarise(
+        n = n(),
+        
+        raw_house =
+          weighted.mean(
+            .data[[resid_col]],
+            .data[[weight_col]],
+            na.rm = TRUE
+          ),
+        
+        .groups = "drop"
+      ) |>
+      
+      mutate(
+        house_effect =
+          raw_house *
+          n / (n + shrinkage_k)
+      )
+    
+    house_effect_tables[[p]] <- house_table
+    
+    effect_lookup <-
+      setNames(
+        house_table$house_effect,
+        house_table[[organisation_col]]
+      )
+    
+    polls[[paste0(p, "_house")]] <-
+      effect_lookup[
+        polls[[organisation_col]]
+      ]
+  }
+  
+  list(
+    polls = polls,
+    house_effect_tables = house_effect_tables
+  )
+}
+
+###############################################################################
+# HOUSE-ADJUSTED RESIDUALS
+#
+# Purpose:
+#   Remove systematic pollster effects from residuals.
+#
+# Components remaining:
+#
+#   - Sampling error
+#   - Campaign noise
+#   - Unexplained variation
+#
+# These adjusted residuals form the basis of covariance estimation.
+###############################################################################
+
+add_adjusted_residuals <- function(
+    polls,
+    parties
+) {
+  
+  for (p in parties) {
+    
+    polls[[paste0(p, "_adj_resid")]] <-
+      polls[[paste0(p, "_resid")]] -
+      polls[[paste0(p, "_house")]]
+  }
+  
+  polls
+}
+
 
 ###############################################################################
 # COVARIANCE ESTIMATION
@@ -219,7 +325,10 @@ estimate_poll_covariance <- function(
 ) {
   
   residual_cols <-
-    paste0(parties, "_resid")
+    paste0(
+      parties,
+      "_adj_resid"
+    )
   
   complete_cases <-
     complete.cases(
@@ -227,10 +336,15 @@ estimate_poll_covariance <- function(
     )
   
   residual_data <-
-    polls[complete_cases, residual_cols]
+    polls[
+      complete_cases,
+      residual_cols
+    ]
   
   weights <-
-    polls[[weight_col]][complete_cases]
+    polls[[weight_col]][
+      complete_cases
+    ]
   
   covariance <-
     cov.wt(
@@ -241,10 +355,11 @@ estimate_poll_covariance <- function(
   
   list(
     covariance = covariance,
-    correlation = cov2cor(covariance),
+    correlation = cov2cor(
+      covariance
+    ),
     residual_data = residual_data
   )
-  
 }
 
 ###############################################################################
@@ -293,6 +408,46 @@ covariance_diagnostics <- function(
     residual_sd = residual_sd
   )
   
+}
+
+###############################################################################
+# HOUSE EFFECT DIAGNOSTICS
+#
+# Purpose:
+#   Display estimated pollster effects by party.
+###############################################################################
+
+display_house_effects <- function(
+    house_effect_tables,
+    parties
+) {
+  
+  for (p in parties) {
+    
+    cat("\n")
+    cat(
+      "================================================\n"
+    )
+    
+    cat(
+      paste(
+        "HOUSE EFFECTS:",
+        p
+      )
+    )
+    
+    cat("\n")
+    cat(
+      "================================================\n"
+    )
+    
+    print(
+      house_effect_tables[[p]] |>
+        arrange(
+          desc(abs(house_effect))
+        )
+    )
+  }
 }
 
 ###############################################################################
@@ -911,19 +1066,38 @@ polls <-
 
 trend_results <-
   fit_poll_trends(
-    polls = polls,
-    parties = parties,
+    polls,
+    parties,
     span = 0.30
   )
 
 polls <-
-  add_poll_residuals(
-    trend_results$polls,
-    parties
-  )
+  trend_results$polls
 
 latest_poll <-
   trend_results$latest_poll
+
+polls <-
+  add_poll_residuals(
+    polls,
+    parties
+  )
+
+house_results <-
+  estimate_house_effects(
+    polls,
+    parties,
+    shrinkage_k = 10
+  )
+
+polls <-
+  house_results$polls
+
+polls <-
+  add_adjusted_residuals(
+    polls,
+    parties
+  )
 
 cov_results <-
   estimate_poll_covariance(
@@ -943,6 +1117,12 @@ diagnostics <-
     residual_data =
       cov_results$residual_data
   )
+
+display_house_effects(
+  house_results$house_effect_tables,
+  parties
+)
+
 
 ###############################################################################
 # DIAGNOSTIC OUTPUT
